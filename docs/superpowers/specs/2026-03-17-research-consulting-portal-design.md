@@ -40,7 +40,7 @@ Email code authentication (no passwords). Clients receive a one-time code via em
 ### Client Portal (authenticated, role: `client`)
 
 **Dashboard (`/dashboard`)**
-Project cards grid. Each card shows project title, status badge (color-coded), and estimated delivery date. Statuses: `Awaiting Payment` (indigo) | `In Progress` (amber) | `Delivered` (green).
+Project cards grid. Each card shows project title, status badge (color-coded), and estimated delivery date. Statuses: `Awaiting Payment` (indigo) | `In Progress` (amber) | `Delivered` (green). `Cancelled` projects are hidden from the client dashboard entirely — they only appear in the admin project list.
 
 **Report View (`/dashboard/projects/:id`)**
 Tabbed layout with five tabs: Summary · Key Findings · Data & Charts · Recommendations · Methodology. PDF download button persistent in the header. Report sections are composed by the consultant in the admin panel and rendered as rich content blocks (text, stat callouts, chart data).
@@ -56,7 +56,7 @@ Profile info, email preferences.
 Accessible only to the consultant's account. Separate nav section within the dashboard.
 
 **Clients (`/admin/clients`)**
-Create client accounts, send invite emails, preview client portal view (read-only admin query — not impersonation).
+Create client accounts, send invite emails. Also lists any users with `role: undefined` (arrived without an invite) so the consultant can re-invite them. Preview client portal is deferred.
 
 **Projects (`/admin/projects`)**
 Create projects, assign to a client, set price, update status, set estimated delivery date.
@@ -79,7 +79,7 @@ Built on top of the template's existing `users`, `authSessions`, and related aut
 | `userId` | `Id<"users">` | The client this project belongs to |
 | `title` | `string` | |
 | `description` | `string` | |
-| `status` | `"awaiting_payment" \| "in_progress" \| "delivered"` | |
+| `status` | `"awaiting_payment" \| "in_progress" \| "delivered" \| "cancelled"` | `cancelled` used when consultant cancels a project created in error |
 | `price` | `number` | In cents |
 | `stripePaymentLinkId` | `string?` | Stripe Payment Link ID |
 | `stripePaymentIntentId` | `string?` | Set after payment confirmed via webhook |
@@ -93,6 +93,8 @@ Built on top of the template's existing `users`, `authSessions`, and related aut
 | `pdfStorageId` | `Id<"_storage">?` | Convex file storage (authenticated URLs, not public) |
 | `sections` | `ReportSection[]` | JSON array of tab content |
 | `published` | `boolean` | False until consultant publishes |
+| `createdAt` | `number` | Unix timestamp |
+| `updatedAt` | `number` | Updated on every save |
 
 ### `ReportSection` (embedded in report)
 ```ts
@@ -120,7 +122,7 @@ Stored on the `users` table as a `role` field: `"client" | "admin"`.
 2. Consultant clicks "Generate Payment Link" → Convex action calls Stripe API to create a Payment Link with `metadata: { projectId }` and `client_reference_id: projectId`
 3. `stripePaymentLinkId` stored on project; status set to `awaiting_payment`
 4. Client sees project card with "Pay Now" button → opens Stripe-hosted checkout
-5. Stripe fires `checkout.session.completed` webhook → Convex HTTP action verifies signature using `stripe.webhooks.constructEvent(body, sig, STRIPE_WEBHOOK_SECRET)` (same pattern as existing template webhook handler in `convex/stripe.ts`) → reads `metadata.projectId` from event (set when Payment Link was created) → project status flips to `in_progress`, `stripePaymentIntentId` stored from `session.payment_intent`
+5. Stripe fires `checkout.session.completed` webhook → Convex HTTP action verifies signature using `stripe.webhooks.constructEvent(body, sig, STRIPE_WEBHOOK_SECRET)` (same pattern as existing template webhook handler in `convex/stripe.ts`) → reads `projectId` from `session.client_reference_id` (Stripe reliably passes this through from Payment Links; do NOT rely on `metadata` which is not propagated to the session object) → project status flips to `in_progress`, `stripePaymentIntentId` stored from `session.payment_intent`
 6. Client receives email: "Your project is now in progress"
 7. Consultant completes research, uploads report in Admin, publishes it → status flips to `delivered`
 8. Client receives email: "Your report is ready"
@@ -133,13 +135,13 @@ If a client abandons checkout or payment is declined, the project remains in `aw
 ## Auth & Access Control
 
 - All `/dashboard/*` and `/admin/*` routes require authentication (TanStack Router guards, existing in template)
-- Admin routes additionally check `user.role === "admin"` — redirect to `/dashboard` if not admin
+- Admin routes additionally check `user.role === "admin"` via TanStack Router guard — redirect to `/dashboard` if not admin. **This guard is UI-only.** Every admin Convex query and mutation independently re-verifies `user.role === "admin"` server-side. The router guard is a UX convenience, not the security boundary.
 - Client-side project queries filter by `userId === currentUser._id` — clients only see their own data
 - Report ownership is verified by joining: `reports → projects.userId === currentUser._id`
 - Admin queries pass an `asAdmin: true` flag and bypass the userId filter after verifying `user.role === "admin"` server-side
 
 ### PDF access
-PDF files are served via short-lived authenticated URLs generated by `ctx.storage.getUrl(storageId)` inside a Convex query. The query verifies ownership before returning the URL. URLs are not publicly accessible by storage ID alone.
+PDF files are served via authenticated URLs generated by `ctx.storage.getUrl(storageId)` inside a Convex query. The URL is fetched **on demand** (when the user clicks "Download PDF"), not embedded in the initial page load, to avoid expiry during long sessions. The query verifies ownership before returning the URL. URLs are not publicly accessible by storage ID alone.
 
 ---
 
@@ -150,20 +152,20 @@ Convex Auth owns the `users` table — rows must be created by the auth system, 
 ### `invites` table
 | Field | Type | Notes |
 |---|---|---|
-| `email` | `string` | Invited client's email (indexed) |
+| `email` | `string` | Invited client's email — **indexed, unique constraint enforced by upsert** |
 | `name` | `string` | Display name |
 | `createdAt` | `number` | |
 
 ### Flow
 1. Consultant fills in client name and email on `/admin/clients` → submits
-2. Convex mutation inserts a row into `invites` (email + name)
-3. Resend sends a welcome email directing the client to `/login` with a note to enter their email to receive a one-time access code
+2. Convex mutation **upserts** into `invites` by email (replaces any existing row for the same email — handles re-invite / resend). Uses `by_email` index.
+3. Resend sends a welcome email directing the client to `/login`
 4. Client visits `/login`, enters their email, Convex Auth sends a 6-digit OTP, client enters it
-5. On successful OTP verification, Convex Auth calls `createOrUpdateUser` — this callback queries `invites` by email. If a matching invite exists: sets `role: "client"` on the new user, stores the name, deletes the invite row
+5. On successful OTP verification, Convex Auth calls `createOrUpdateUser` — this callback queries `invites` by email (using `by_email` index). If a matching invite exists: sets `role: "client"` on the new user, stores the name, deletes the invite row
 6. Client lands on `/dashboard`
 7. If the OTP expires (1 hour), client requests a new one from the login page — no separate resend needed
 
-New users who arrive without a matching invite (e.g. someone who finds the login page) will be created with `role: undefined`. Admin routes check `role === "admin"` and client portal access checks `role === "client"` — users with no role see an "access pending" message and cannot enter either area.
+New users who arrive without a matching invite will be created with `role: undefined`. They see an "access pending" message. The consultant recovers this by re-inviting the same email from `/admin/clients` — this creates a new invite row, and `role: "client"` will be set on the user's next login via the `createOrUpdateUser` hook.
 
 ---
 
